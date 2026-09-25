@@ -2,35 +2,31 @@
 
 import os
 import time
-import googleapiclient.discovery
-import google.oauth2.service_account as service_account
+import json
+
+# ==============================================================================
+# DIFFERENCE 1: IMPORT MODERN CLOUD CLIENT LIBRARY
+# Legacy (Discovery):
+#   from googleapiclient import discovery
+# Modern (Cloud Client Library for Extra Credit):
+#   from google.cloud import compute_v1 (google-cloud-compute package)
+# ==============================================================================
+from google.cloud import compute_v1
 
 CREDENTIALS_FILE = 'service-credentials.json'
-ZONE = 'us-west1-b'
+ZONE = 'us-west1-c'
 
-# 1. Authenticate and extract project ID from the service account credentials
-credentials = service_account.Credentials.from_service_account_file(filename=CREDENTIALS_FILE)
-project = credentials.project_id
-service = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
+# Set authentication credentials and load project ID
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
+with open(CREDENTIALS_FILE, 'r') as f:
+    project = json.load(f)['project_id']
 
-def wait_for_zone_operation(compute, project, zone, operation):
-    """Wait for a zone-level asynchronous operation to complete."""
-    print(f"Waiting for zone operation {operation['name']} to finish...")
-    while True:
-        result = compute.zoneOperations().get(
-            project=project,
-            zone=zone,
-            operation=operation['name']
-        ).execute()
+# Initialize typed clients
+instances_client = compute_v1.InstancesClient()
+images_client = compute_v1.ImagesClient()
 
-        if result.get('status') == 'DONE':
-            if 'error' in result:
-                raise Exception(result['error'])
-            return result
-        time.sleep(2)
-
-# Startup script to configure and launch the Flask application on VM-2
-FLASK_STARTUP_SCRIPT = """#!/bin/bash
+# Startup script to be executed on VM-2 (Flask app setup)
+VM2_STARTUP_SCRIPT = """#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -51,86 +47,110 @@ flask init-db
 nohup flask run --host=0.0.0.0 --port=5000 > /var/log/flask.log 2>&1 &
 """
 
-# Shell script executed upon VM-1 startup
-VM1_SHELL_STARTUP = """#!/bin/bash
+# Startup script executed by VM-1 upon booting
+# It installs google-cloud-compute, fetches payload from metadata, and triggers vm1_launch_vm2.py
+VM1_STARTUP_SCRIPT = """#!/bin/bash
 set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y python3 python3-pip curl
+
+# Install Cloud Client Library on VM-1
+pip3 install google-cloud-compute
+
 mkdir -p /srv
 cd /srv
 
-# Fetch injected files from link-local metadata
-curl -f http://metadata.google.internal/computeMetadata/v1/instance/attributes/vm2-startup-script -H "Metadata-Flavor: Google" > vm2-startup-script.sh
-curl -f http://metadata.google.internal/computeMetadata/v1/instance/attributes/service-credentials -H "Metadata-Flavor: Google" > service-credentials.json
-curl -f http://metadata.google.internal/computeMetadata/v1/instance/attributes/vm1-launch-code -H "Metadata-Flavor: Google" > vm1_launch_vm2.py
+# Download embedded metadata files from Google link-local metadata server
+curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/service-credentials > service-credentials.json
+curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/vm1-launch-vm2-code > vm1_launch_vm2.py
+curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/vm2-startup-script > vm2-startup-script.sh
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y python3 python3-pip
+chmod +x vm1_launch_vm2.py
 
-pip3 install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib uritemplate
-
-python3 ./vm1_launch_vm2.py
+# Execute VM-2 provisioner script
+python3 /srv/vm1_launch_vm2.py > /var/log/vm1_launch_vm2.log 2>&1
 """
 
-def create_vm1(compute, project, zone):
-    """Create launcher VM-1 with metadata containing credentials and scripts to launch VM-2."""
-    vm1_name = f"launching-vm1-{int(time.time())}"
+def create_vm1(project_id, zone):
+    """Deploy VM-1 and provide required credentials and provisioner code via Metadata."""
+    instance_name = f"launching-vm1-{int(time.time())}"
 
-    # Read local service credentials and launcher code contents
+    # Read credentials file content to inject into metadata
     with open(CREDENTIALS_FILE, 'r') as f:
         credentials_content = f.read()
 
+    # Read vm1_launch_vm2.py code to inject into metadata
     with open('vm1_launch_vm2.py', 'r') as f:
-        vm1_launch_code_content = f.read()
+        launch_vm2_content = f.read()
 
-    image_response = compute.images().getFromFamily(
-        project='ubuntu-os-cloud',
-        family='ubuntu-2204-lts'
-    ).execute()
-    source_disk_image = image_response['selfLink']
+    # Query latest Ubuntu 22.04 LTS image
+    image = images_client.get_from_family(project="ubuntu-os-cloud", family="ubuntu-2204-lts")
 
-    config = {
-        'name': vm1_name,
-        'machineType': f"zones/{zone}/machineTypes/f1-micro",
-        'disks': [
-            {
-                'boot': True,
-                'autoDelete': True,
-                'initializeParams': {
-                    'sourceImage': source_disk_image,
-                }
-            }
-        ],
-        'networkInterfaces': [{
-            'network': f"projects/{project}/global/networks/default",
-            'accessConfigs': [
-                {'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}
-            ]
-        }],
-        'metadata': {
-            'items': [
-                {'key': 'startup-script', 'value': VM1_SHELL_STARTUP},
-                {'key': 'vm2-startup-script', 'value': FLASK_STARTUP_SCRIPT},
-                {'key': 'service-credentials', 'value': credentials_content},
-                {'key': 'vm1-launch-code', 'value': vm1_launch_code_content}
-            ]
-        }
-    }
+    boot_disk = compute_v1.AttachedDisk(
+        boot=True,
+        auto_delete=True,
+        initialize_params=compute_v1.AttachedDiskInitializeParams(
+            source_image=image.self_link
+        )
+    )
 
-    print(f"Creating launcher VM-1: '{vm1_name}'...")
-    op = compute.instances().insert(
-        project=project,
+    access_config = compute_v1.AccessConfig(
+        type_=compute_v1.AccessConfig.Type.ONE_TO_ONE_NAT.name,
+        name="External NAT"
+    )
+    network_interface = compute_v1.NetworkInterface(
+        network=f"projects/{project_id}/global/networks/default",
+        access_configs=[access_config]
+    )
+
+    # Pack startup script, service credentials, provisioner code, and VM-2 startup script into metadata items
+    metadata = compute_v1.Metadata(
+        items=[
+            compute_v1.Items(key="startup-script", value=VM1_STARTUP_SCRIPT),
+            compute_v1.Items(key="service-credentials", value=credentials_content),
+            compute_v1.Items(key="vm1-launch-vm2-code", value=launch_vm2_content),
+            compute_v1.Items(key="vm2-startup-script", value=VM2_STARTUP_SCRIPT),
+        ]
+    )
+
+    instance_resource = compute_v1.Instance(
+        name=instance_name,
+        machine_type=f"zones/{zone}/machineTypes/f1-micro",
+        disks=[boot_disk],
+        network_interfaces=[network_interface],
+        metadata=metadata
+    )
+
+    print(f"Creating VM-1 ('{instance_name}') in zone '{zone}' using Cloud Client Libraries...")
+
+    # Wait for VM-1 creation to complete
+    operation = instances_client.insert(
+        project=project_id,
         zone=zone,
-        body=config
-    ).execute()
-    wait_for_zone_operation(compute, project, zone, op)
-    print(f"Launcher VM-1 '{vm1_name}' created.")
-    return vm1_name
+        instance_resource=instance_resource
+    )
+    operation.result()
+    print(f"VM-1 ('{instance_name}') created successfully.")
+
+    instance = instances_client.get(project=project_id, zone=zone, instance=instance_name)
+    external_ip = instance.network_interfaces[0].access_configs[0].nat_i_p
+    print(f"VM-1 External IP: {external_ip}")
+    print("VM-1 is now installing dependencies and triggering VM-2 creation...")
+    return instance_name
+
+def list_instances(project_id, zone):
+    """List all instances in the specified zone."""
+    print(f"\nCurrent instances in zone '{zone}':")
+    instance_list = instances_client.list(project=project_id, zone=zone)
+    for inst in instance_list:
+        ip = inst.network_interfaces[0].access_configs[0].nat_i_p if inst.network_interfaces[0].access_configs else "None"
+        print(f" - {inst.name} | Status: {inst.status} | External IP: {ip}")
 
 def main():
-    print(f"Using project: {project}")
-    vm1_name = create_vm1(service, project, ZONE)
-    print("\nVM-1 has been started. It will now fetch metadata and create VM-2 in the background.")
-    print("You can verify VM-2's appearance using: gcloud compute instances list")
+    print(f"Using Project: {project}")
+    create_vm1(project, ZONE)
+    list_instances(project, ZONE)
 
 if __name__ == '__main__':
     main()

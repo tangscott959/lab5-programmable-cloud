@@ -1,82 +1,105 @@
 #!/usr/bin/env python3
-import time
+
 import os
-import googleapiclient.discovery
-import google.oauth2.service_account as service_account
+import time
+import json
 
-ZONE = 'us-west1-b'
+# ==============================================================================
+# DIFFERENCE 1: IMPORT MODERN CLOUD CLIENT LIBRARY
+# Legacy (Discovery):
+#   from googleapiclient import discovery
+# Modern (Cloud Client Library for Extra Credit):
+#   from google.cloud import compute_v1 (google-cloud-compute package)
+# ==============================================================================
+from google.cloud import compute_v1
+
 CREDENTIALS_FILE = 'service-credentials.json'
+ZONE = 'us-west1-c'
 
-credentials = service_account.Credentials.from_service_account_file(filename=CREDENTIALS_FILE)
-# Read project_id directly from credentials to avoid environment variable dependencies
-project = credentials.project_id
-compute = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
+# Configure credentials and extract project ID
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
+with open(CREDENTIALS_FILE, 'r') as f:
+    project = json.load(f)['project_id']
 
-def wait_for_zone_operation(compute, project, zone, operation):
-    """Wait for a zone-level asynchronous operation to complete."""
-    while True:
-        result = compute.zoneOperations().get(
-            project=project,
-            zone=zone,
-            operation=operation['name']
-        ).execute()
-        if result.get('status') == 'DONE':
-            if 'error' in result:
-                raise Exception(result['error'])
-            return result
-        time.sleep(2)
+# ==============================================================================
+# DIFFERENCE 2: SPECIALIZED CLIENT INITIALIZATION
+# Legacy:
+#   service = discovery.build('compute', 'v1', credentials=credentials)
+# Modern:
+#   Directly instantiate typed client classes
+# ==============================================================================
+instances_client = compute_v1.InstancesClient()
+images_client = compute_v1.ImagesClient()
 
-def main():
-    # Read the Flask startup script injected for VM-2
-    with open('vm2-startup-script.sh', 'r') as f:
-        vm2_startup_script = f.read()
+# Read the startup script intended for VM-2 from the local filesystem
+with open('vm2-startup-script.sh', 'r') as f:
+    vm2_startup_script = f.read()
 
-    vm2_name = f"flask-vm2-{int(time.time())}"
-    image_response = compute.images().getFromFamily(
-        project='ubuntu-os-cloud',
-        family='ubuntu-2204-lts'
-    ).execute()
-    source_disk_image = image_response['selfLink']
+def create_vm2(project_id, zone):
+    """Launch VM-2 directly from within VM-1 using Cloud Client Libraries."""
+    instance_name = f"flask-vm2-{int(time.time())}"
 
-    config = {
-        'name': vm2_name,
-        'machineType': f"zones/{ZONE}/machineTypes/f1-micro",
-        'disks': [
-            {
-                'boot': True,
-                'autoDelete': True,
-                'initializeParams': {
-                    'sourceImage': source_disk_image,
-                }
-            }
-        ],
-        'networkInterfaces': [{
-            'network': f"projects/{project}/global/networks/default",
-            'accessConfigs': [
-                {'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}
-            ]
-        }],
-        'tags': {
-            'items': ['allow-5000']
-        },
-        'metadata': {
-            'items': [
-                {
-                    'key': 'startup-script',
-                    'value': vm2_startup_script
-                }
-            ]
-        }
-    }
+    # Query latest Ubuntu 22.04 LTS image
+    image = images_client.get_from_family(project="ubuntu-os-cloud", family="ubuntu-2204-lts")
 
-    print(f"VM-1 launching VM-2: {vm2_name}...")
-    op = compute.instances().insert(
-        project=project,
-        zone=ZONE,
-        body=config
-    ).execute()
-    wait_for_zone_operation(compute, project, ZONE, op)
-    print("VM-2 created successfully from VM-1.")
+    # Configure boot disk
+    boot_disk = compute_v1.AttachedDisk(
+        boot=True,
+        auto_delete=True,
+        initialize_params=compute_v1.AttachedDiskInitializeParams(
+            source_image=image.self_link
+        )
+    )
+
+    # Configure network interface with external NAT IP
+    access_config = compute_v1.AccessConfig(
+        type_=compute_v1.AccessConfig.Type.ONE_TO_ONE_NAT.name,
+        name="External NAT"
+    )
+    network_interface = compute_v1.NetworkInterface(
+        network=f"projects/{project_id}/global/networks/default",
+        access_configs=[access_config]
+    )
+
+    # Inject VM-2 startup script and firewall network tag
+    metadata = compute_v1.Metadata(
+        items=[compute_v1.Items(key="startup-script", value=vm2_startup_script)]
+    )
+    tags = compute_v1.Tags(items=["allow-5000"])
+
+    # Assemble instance resource object
+    instance_resource = compute_v1.Instance(
+        name=instance_name,
+        machine_type=f"zones/{zone}/machineTypes/f1-micro",
+        disks=[boot_disk],
+        network_interfaces=[network_interface],
+        tags=tags,
+        metadata=metadata
+    )
+
+    print(f"[VM-1] Launching '{instance_name}' in zone '{zone}' using Cloud Client Libraries...")
+
+    # ==========================================================================
+    # DIFFERENCE 3: AUTOMATIC OPERATION WAITING
+    # Legacy:
+    #   op = compute.instances().insert(...).execute() with manual while loop
+    # Modern:
+    #   operation = instances_client.insert(...)
+    #   operation.result() automatically blocks until complete
+    # ==========================================================================
+    operation = instances_client.insert(
+        project=project_id,
+        zone=zone,
+        instance_resource=instance_resource
+    )
+    operation.result()
+    print(f"[VM-1] '{instance_name}' created successfully.")
+
+    # Retrieve and print external IP
+    instance = instances_client.get(project=project_id, zone=zone, instance=instance_name)
+    external_ip = instance.network_interfaces[0].access_configs[0].nat_i_p
+    print(f"[VM-1] VM-2 External IP: {external_ip}")
+    print(f"[VM-1] Flask accessible at: http://{external_ip}:5000")
 
 if __name__ == '__main__':
-    main()
+    create_vm2(project, ZONE)
