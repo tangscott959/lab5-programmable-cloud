@@ -1,9 +1,7 @@
-# Provisioning Timing Results
+# Instance Creation Timings (From Snapshot)
 
-Time required to create instances from snapshot:
-
-| Instance Name | Provisioning Time (seconds) |
-| --- | --- |
-| flask-clone-1-1789707376 | 25.63 s |
-| flask-clone-2-1789707401 | 25.66 s |
-| flask-clone-3-1789707427 | 46.44 s |
+| Instance Name | Creation Time (seconds) |
+|---|---|
+| clone-1790312252-1 | 29.78 |
+| clone-1790312252-2 | 24.90 |
+| clone-1790312252-3 | 31.58 |

@@ -1,171 +1,207 @@
 #!/usr/bin/env python3
 
-import argparse
 import os
 import time
-from pprint import pprint
+import json
 
-import googleapiclient.discovery
-import google.auth
+# ==============================================================================
+# DIFFERENCE 1: IMPORT SOURCE AND LIBRARY PACKAGE
+# Legacy (Discovery):
+#   from googleapiclient import discovery
+#   from google.oauth2 import service_account
+# Modern (Cloud Client Library for Extra Credit):
+#   from google.cloud import compute_v1 (google-cloud-compute package)
+# ==============================================================================
+from google.cloud import compute_v1
 
-credentials, project = google.auth.default()
-service = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
-
-#
-# Stub code - just lists all instances
-#
-#!/usr/bin/env python3
-
-import os
-import time
-import google.auth
-import googleapiclient.discovery
-
-# Authenticate and construct Compute Engine service client
-credentials, project = google.auth.default()
-compute = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
-
+CREDENTIALS_FILE = 'service-credentials.json'
 ZONE = 'us-west1-b'
 
-# TODO: Replace with your actual Part 1 instance name if different
-BASE_INSTANCE_NAME = 'flask-instance-1789674184'
-SNAPSHOT_NAME = f"base-snapshot-{BASE_INSTANCE_NAME}"
+# Source instance name from Part 1
+SOURCE_INSTANCE_NAME = 'flask-instance-1790311357'
+SNAPSHOT_NAME = f"base-snapshot-{SOURCE_INSTANCE_NAME}"
 
+# Authentication setup using standard environment variable
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
+with open(CREDENTIALS_FILE, 'r') as f:
+    project = json.load(f)['project_id']
 
-def wait_for_zone_operation(compute, project, zone, operation):
-    """Wait for a zone-level asynchronous operation to complete."""
-    print(f"Waiting for zone operation {operation['name']} to finish...")
-    while True:
-        result = compute.zoneOperations().get(
-            project=project,
-            zone=zone,
-            operation=operation['name']
-        ).execute()
+# ==============================================================================
+# DIFFERENCE 2: SPECIALIZED CLIENT INSTANTIATION
+# Legacy:
+#   service = discovery.build('compute', 'v1', credentials=credentials)
+# Modern:
+#   Directly instantiate targeted client classes:
+#   - compute_v1.InstancesClient()
+#   - compute_v1.DisksClient()
+#   - compute_v1.SnapshotsClient()
+# ==============================================================================
+instances_client = compute_v1.InstancesClient()
+disks_client = compute_v1.DisksClient()
+snapshots_client = compute_v1.SnapshotsClient()
 
-        if result.get('status') == 'DONE':
-            if 'error' in result:
-                raise Exception(result['error'])
-            return result
-        time.sleep(2)
+def get_boot_disk_name(project_id, zone, instance_name):
+    """Retrieve the boot disk name associated with the source instance."""
+    # ==========================================================================
+    # DIFFERENCE 3: GET INSTANCE DETAILS
+    # Legacy:
+    #   instance = compute.instances().get(project=..., zone=..., instance=...).execute()
+    #   Check instance['disks'] dictionary keys
+    # Modern:
+    #   instance = instances_client.get(project=..., zone=..., instance=...)
+    #   Access strongly typed attributes: instance.disks[...].boot and .source
+    # ==========================================================================
+    instance = instances_client.get(project=project_id, zone=zone, instance=instance_name)
+    for disk in instance.disks:
+        if disk.boot:
+            return disk.source.split('/')[-1]
+    raise RuntimeError(f"No boot disk found on instance {instance_name}")
 
+def create_snapshot_from_disk(project_id, zone, disk_name, snapshot_name):
+    """Create a persistent disk snapshot using the Cloud Client DisksClient."""
+    try:
+        existing = snapshots_client.get(project=project_id, snapshot=snapshot_name)
+        if existing:
+            print(f"Snapshot '{snapshot_name}' already exists. Skipping creation.")
+            return existing.self_link
+    except Exception:
+        pass
 
-def get_boot_disk_name(compute, project, zone, instance_name):
-    """Retrieve the boot disk name of a given instance."""
-    instance = compute.instances().get(
-        project=project,
-        zone=zone,
-        instance=instance_name
-    ).execute()
-
-    for disk in instance.get('disks', []):
-        if disk.get('boot', False):
-            # 'source' has the full URL: projects/.../zones/.../disks/<disk-name>
-            disk_url = disk['source']
-            disk_name = disk_url.split('/')[-1]
-            return disk_name
-
-    raise RuntimeError(f"Could not find boot disk for instance {instance_name}")
-
-
-def create_snapshot_from_disk(compute, project, zone, disk_name, snapshot_name):
-    """Create a snapshot from a specified disk if it does not already exist."""
-    # Check if snapshot already exists
-    snapshots = compute.snapshots().list(project=project).execute()
-    existing_snapshots = [s['name'] for s in snapshots.get('items', [])]
-    if snapshot_name in existing_snapshots:
-        print(f"Snapshot '{snapshot_name}' already exists. Skipping creation.")
-        snapshot_url = compute.snapshots().get(project=project, snapshot=snapshot_name).execute()['selfLink']
-        return snapshot_url
+    # ==========================================================================
+    # DIFFERENCE 4: SNAPSHOT RESOURCE CONFIGURATION
+    # Legacy:
+    #   Pass raw dict: body={'name': snapshot_name, 'description': ...}
+    # Modern:
+    #   Instantiate typed Protobuf object compute_v1.Snapshot(...)
+    # ==========================================================================
+    snapshot_resource = compute_v1.Snapshot(
+        name=snapshot_name,
+        description=f"Snapshot created from disk {disk_name}"
+    )
 
     print(f"Creating snapshot '{snapshot_name}' from disk '{disk_name}'...")
-    snapshot_body = {
-        'name': snapshot_name,
-        'description': f"Snapshot taken from {disk_name}"
-    }
-
-    op = compute.disks().createSnapshot(
-        project=project,
+    
+    # ==========================================================================
+    # DIFFERENCE 5: SNAPSHOT CREATION & AUTOMATIC OPERATION POLLING
+    # Legacy:
+    #   op = compute.disks().createSnapshot(project=..., zone=..., disk=..., body=...).execute()
+    #   Manual while loop polling zoneOperations / globalOperations
+    # Modern:
+    #   operation = disks_client.create_snapshot(project=..., zone=..., disk=..., snapshot_resource=...)
+    #   operation.result() automatically blocks until the snapshot is ready
+    # ==========================================================================
+    operation = disks_client.create_snapshot(
+        project=project_id,
         zone=zone,
         disk=disk_name,
-        body=snapshot_body
-    ).execute()
-    wait_for_zone_operation(compute, project, zone, op)
-    print("Snapshot created successfully.")
+        snapshot_resource=snapshot_resource
+    )
+    operation.result()  # Blocks until snapshot is completed
+    print(f"Snapshot '{snapshot_name}' created successfully.")
 
-    snapshot_info = compute.snapshots().get(project=project, snapshot=snapshot_name).execute()
-    return snapshot_info['selfLink']
+    snapshot = snapshots_client.get(project=project_id, snapshot=snapshot_name)
+    return snapshot.self_link
 
+def create_instance_from_snapshot(project_id, zone, instance_name, snapshot_link):
+    """Create a new Compute Engine instance using a disk snapshot."""
+    # ==========================================================================
+    # DIFFERENCE 6: SPECIFYING SNAPSHOT AS BOOT DISK SOURCE
+    # Legacy:
+    #   Dictionary: 'initializeParams': {'sourceSnapshot': snapshot_link}
+    # Modern:
+    #   Protobuf field: compute_v1.AttachedDiskInitializeParams(source_snapshot=snapshot_link)
+    # ==========================================================================
+    boot_disk = compute_v1.AttachedDisk(
+        boot=True,
+        auto_delete=True,
+        initialize_params=compute_v1.AttachedDiskInitializeParams(
+            source_snapshot=snapshot_link
+        )
+    )
 
-def create_instance_from_snapshot(compute, project, zone, instance_name, snapshot_link):
-    """Create a new VM instance using the specified snapshot as its boot disk source."""
-    machine_type = f"zones/{zone}/machineTypes/f1-micro"
+    access_config = compute_v1.AccessConfig(
+        type_=compute_v1.AccessConfig.Type.ONE_TO_ONE_NAT.name,
+        name="External NAT"
+    )
+    network_interface = compute_v1.NetworkInterface(
+        network=f"projects/{project_id}/global/networks/default",
+        access_configs=[access_config]
+    )
 
-    config = {
-        'name': instance_name,
-        'machineType': machine_type,
-        'disks': [
-            {
-                'boot': True,
-                'autoDelete': True,
-                'initializeParams': {
-                    'sourceSnapshot': snapshot_link,
-                }
-            }
-        ],
-        'networkInterfaces': [{
-            'network': f"projects/{project}/global/networks/default",
-            'accessConfigs': [
-                {'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}
-            ]
-        }],
-        'tags': {
-            'items': ['allow-5000']
-        }
-    }
+    tags = compute_v1.Tags(items=["allow-5000"])
+
+    # Startup script only needs to start the already existing application
+    startup_script = """#!/bin/bash
+cd /srv/flask-tutorial
+export FLASK_APP=flaskr
+nohup flask run --host=0.0.0.0 --port=5000 > /var/log/flask.log 2>&1 &
+"""
+    metadata = compute_v1.Metadata(
+        items=[compute_v1.Items(key="startup-script", value=startup_script)]
+    )
+
+    instance_resource = compute_v1.Instance(
+        name=instance_name,
+        machine_type=f"zones/{zone}/machineTypes/f1-micro",
+        disks=[boot_disk],
+        network_interfaces=[network_interface],
+        tags=tags,
+        metadata=metadata
+    )
 
     print(f"Creating instance '{instance_name}' from snapshot...")
-    start_time = time.perf_counter()
+    start_time = time.time()
 
-    op = compute.instances().insert(
-        project=project,
+    # ==========================================================================
+    # DIFFERENCE 7: INSTANCE CREATION AND TIMING BENCHMARK
+    # Legacy:
+    #   compute.instances().insert(...).execute() with custom polling loop
+    # Modern:
+    #   instances_client.insert(...).result() blocks accurately until provisioned
+    # ==========================================================================
+    operation = instances_client.insert(
+        project=project_id,
         zone=zone,
-        body=config
-    ).execute()
-    wait_for_zone_operation(compute, project, zone, op)
+        instance_resource=instance_resource
+    )
+    operation.result()  # Blocks until the instance is fully provisioned
 
-    elapsed_time = time.perf_counter() - start_time
+    elapsed_time = time.time() - start_time
     print(f"Instance '{instance_name}' created in {elapsed_time:.2f} seconds.")
+
+    # Retrieve assigned external IP address
+    inst = instances_client.get(project=project_id, zone=zone, instance=instance_name)
+    external_ip = inst.network_interfaces[0].access_configs[0].nat_i_p
+    print(f"Instance '{instance_name}' IP: {external_ip} | http://{external_ip}:5000")
+
     return elapsed_time
 
-
 def main():
-    print(f"1. Resolving boot disk for '{BASE_INSTANCE_NAME}'...")
-    boot_disk_name = get_boot_disk_name(compute, project, ZONE, BASE_INSTANCE_NAME)
-    print(f"Found boot disk: {boot_disk_name}")
+    print(f"Project: {project}")
+    print(f"Source Instance: {SOURCE_INSTANCE_NAME}")
 
-    print(f"\n2. Creating base snapshot: {SNAPSHOT_NAME}...")
-    snapshot_link = create_snapshot_from_disk(compute, project, ZONE, boot_disk_name, SNAPSHOT_NAME)
+    # 1. Retrieve the source instance boot disk and snapshot it
+    boot_disk_name = get_boot_disk_name(project, ZONE, SOURCE_INSTANCE_NAME)
+    snapshot_link = create_snapshot_from_disk(project, ZONE, boot_disk_name, SNAPSHOT_NAME)
 
-    print("\n3. Provisioning 3 cloned instances from snapshot...")
-    timing_results = []
+    # 2. Sequentially launch 3 instances and measure individual creation durations
+    timing_records = []
+    base_name = f"clone-{int(time.time())}"
 
     for i in range(1, 4):
-        clone_name = f"flask-clone-{i}-{int(time.time())}"
-        duration = create_instance_from_snapshot(compute, project, ZONE, clone_name, snapshot_link)
-        timing_results.append((clone_name, duration))
+        inst_name = f"{base_name}-{i}"
+        duration = create_instance_from_snapshot(project, ZONE, inst_name, snapshot_link)
+        timing_records.append((inst_name, duration))
 
-    # Write timing results to TIMING.md as required by the assignment
-    timing_file_path = os.path.join(os.path.dirname(__file__), 'TIMING.md')
-    with open(timing_file_path, 'w') as f:
-        f.write("# Provisioning Timing Results\n\n")
-        f.write("Time required to create instances from snapshot:\n\n")
-        f.write("| Instance Name | Provisioning Time (seconds) |\n")
-        f.write("| --- | --- |\n")
-        for name, duration in timing_results:
-            f.write(f"| {name} | {duration:.2f} s |\n")
+    # 3. Output results into TIMING.md
+    with open("TIMING.md", "w") as f:
+        f.write("# Instance Creation Timings (From Snapshot)\n\n")
+        f.write("| Instance Name | Creation Time (seconds) |\n")
+        f.write("|---|---|\n")
+        for name, duration in timing_records:
+            f.write(f"| {name} | {duration:.2f} |\n")
 
-    print(f"\nTiming results successfully saved to {timing_file_path}")
-
+    print("\nBenchmark completed. Timings recorded to TIMING.md.")
 
 if __name__ == '__main__':
     main()
